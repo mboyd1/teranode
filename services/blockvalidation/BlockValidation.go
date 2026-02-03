@@ -150,6 +150,9 @@ type BlockValidation struct {
 	// blockHashesCurrentlyValidated tracks blocks in validation process (for setTxMined)
 	blockHashesCurrentlyValidated *txmap.SwissMap
 
+	// setMinedMu protects the check-and-claim operation for blockHashesCurrentlyValidated
+	setMinedMu sync.Mutex
+
 	// blocksCurrentlyValidating tracks blocks being validated to prevent concurrent validation
 	blocksCurrentlyValidating *txmap.SyncedMap[chainhash.Hash, *validationResult]
 
@@ -463,31 +466,38 @@ func (u *BlockValidation) start(ctx context.Context) error {
 					continue
 				}
 
-				_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
-
-				if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
-					// Check if context is done before logging
-					select {
-					case <-ctx.Done():
-						return
-					default:
-					}
-
-					u.logger.Errorf("[BlockValidation:start][%s] failed setTxMined: %s", blockHash.String(), err)
-
-					// Always remove from map on failure to prevent blocking child blocks
-					if deleteErr := u.blockHashesCurrentlyValidated.Delete(*blockHash); deleteErr != nil {
-						u.logger.Errorf("[BlockValidation:start][%s] failed to delete blockHash from blockHashesCurrentlyValidated: %s", blockHash.String(), deleteErr)
-					}
-
-					if !errors.Is(err, errors.ErrBlockNotFound) {
-						time.Sleep(1 * time.Second)
-						// put the block back in the setMinedChan for retry
-						u.setMinedChan <- blockHash
-					}
-				} else {
-					_ = u.blockHashesCurrentlyValidated.Delete(*blockHash)
+				// Atomically check and claim the block to prevent duplicate processing
+				if !u.tryClaimBlockForSetMined(blockHash) {
+					u.logger.Debugf("[BlockValidation:start][%s] block already being processed, skipping", blockHash.String())
+					continue
 				}
+
+				// Process in anonymous function to ensure cleanup via defer
+				func() {
+					// Ensure cleanup happens regardless of success, error, panic, or context cancellation
+					defer func() {
+						if deleteErr := u.blockHashesCurrentlyValidated.Delete(*blockHash); deleteErr != nil {
+							u.logger.Errorf("[BlockValidation:start][%s] failed to delete blockHash from blockHashesCurrentlyValidated: %s", blockHash.String(), deleteErr)
+						}
+					}()
+
+					if err = u.setTxMinedStatus(ctx, blockHash, blockHeaderMeta.Invalid); err != nil {
+						// Check if context is done before logging
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+
+						u.logger.Errorf("[BlockValidation:start][%s] failed setTxMined: %s", blockHash.String(), err)
+
+						if !errors.Is(err, errors.ErrBlockNotFound) {
+							time.Sleep(1 * time.Second)
+							// put the block back in the setMinedChan for retry
+							u.setMinedChan <- blockHash
+						}
+					}
+				}()
 
 				u.logger.Debugf("[BlockValidation:start][%s] block setTxMined DONE in %s", blockHash.String(), time.Since(startTime))
 			}
@@ -561,9 +571,20 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgro
 		for _, block := range blocksMinedNotSet {
 			blockHash := block.Hash()
 
-			_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
+			// Atomically check and claim the block to prevent duplicate processing
+			if !u.tryClaimBlockForSetMined(blockHash) {
+				u.logger.Debugf("[BlockValidation:start] block %s already being processed, skipping", blockHash.String())
+				continue
+			}
 
 			g.Go(func() error {
+				// Ensure cleanup happens regardless of success, error, panic, or context cancellation
+				defer func() {
+					if deleteErr := u.blockHashesCurrentlyValidated.Delete(*blockHash); deleteErr != nil {
+						u.logger.Errorf("[BlockValidation:start][%s] failed to delete blockHash from blockHashesCurrentlyValidated: %s", blockHash.String(), deleteErr)
+					}
+				}()
+
 				u.logger.Debugf("[BlockValidation:start] processing block mined not set: %s", blockHash.String())
 
 				select {
@@ -587,10 +608,6 @@ func (u *BlockValidation) processBlockMinedNotSet(ctx context.Context, g *errgro
 							u.logger.Errorf("[BlockValidation:start] failed to set block mined: %s", err)
 						}
 						u.setMinedChan <- blockHash
-					}
-
-					if err = u.blockHashesCurrentlyValidated.Delete(*blockHash); err != nil {
-						u.logger.Errorf("[BlockValidation:start] failed to delete block from currently validated: %s", err)
 					}
 
 					u.logger.Infof("[BlockValidation:start] processed block mined and set mined_set: %s", blockHash.String())
@@ -762,6 +779,21 @@ func (u *BlockValidation) hasValidSubtrees(block *model.Block) bool {
 	}
 
 	return block.SubtreesLoaded()
+}
+
+// tryClaimBlockForSetMined atomically checks if a block is already being processed for setTxMined
+// and claims it if not. Returns true if the block was successfully claimed, false if already in progress.
+// This prevents duplicate processing when multiple sources (Kafka notifications, periodic jobs, retries)
+// attempt to process the same block concurrently.
+func (u *BlockValidation) tryClaimBlockForSetMined(blockHash *chainhash.Hash) bool {
+	u.setMinedMu.Lock()
+	defer u.setMinedMu.Unlock()
+
+	if u.blockHashesCurrentlyValidated.Exists(*blockHash) {
+		return false
+	}
+	_ = u.blockHashesCurrentlyValidated.Put(*blockHash)
+	return true
 }
 
 // setTxMinedStatus marks all transactions within a block as mined in the blockchain system.
