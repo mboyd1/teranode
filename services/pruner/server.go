@@ -97,6 +97,8 @@ func New(
 		blockchainClient:    blockchainClient,
 		blockAssemblyClient: blockAssemblyClient,
 		blobStores:          make(map[storetypes.BlobStoreType]blob.Store),
+		pruneNotify:         make(chan pruneSignal, 1),
+		blobNotify:          make(chan pruneSignal, 1),
 		stats:               gocore.NewStat("pruner"),
 	}
 }
@@ -266,10 +268,6 @@ func (s *Server) Start(ctx context.Context, readyCh chan<- struct{}) error {
 	if err != nil {
 		return err
 	}
-
-	// Initialize notify channels (buffer of 1 for drain-and-replace pattern)
-	s.pruneNotify = make(chan pruneSignal, 1)
-	s.blobNotify = make(chan pruneSignal, 1)
 
 	// Start the pruner service (Aerospike or SQL)
 	if s.prunerService != nil {
