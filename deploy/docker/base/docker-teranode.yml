@@ -145,6 +145,7 @@ services:
   peer:
     <<: *teranode-base
     container_name: peer
+    init: true
     entrypoint: [ "/app/entrypoint.sh" ]
     command: [ "-p2p=1" ]
     ports:
